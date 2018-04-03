@@ -104,6 +104,73 @@ class MattNet():
     model.cuda()
     return model
 
+  def get_att_feats(self, img_path, nms_thresh=.3, conf_thresh=.65):
+    """
+    Arguments:
+    - img_path   : path to image
+    - nms_thresh : nms threshold 
+    - conf_thresh: confidence threshold [0,1]
+    Return "data" is a dict of
+    - det_ids: list of det_ids, order consistent with dets and masks
+    - dets   : [{det_id, box, category_name, category_id, score}], box is [xywh] and category_id is coco_cat_id
+    - masks  : ndarray (n, im_h, im_w) uint8 [0,1]
+    - Feats  :
+      - pool5     : Variable cuda (n, 1024, 7, 7)
+      - fc7       : Variable cuda (n, 2048, 7, 7)
+      - lfeats    : Variable cuda (n, 5)
+      - dif_lfeats: Variable cuda (n, 5*topK)
+      - cxt_fc7   : Variable cuda (n, topK, 2048)
+      - cxt_lfeats: Variable cuda (n, topK, 5)
+    - cxt_det_ids : list of [surrounding_det_ids] for each det_id
+    """
+    # read image
+    im = imread(img_path)
+
+    # 1st step: detect objects
+    scores, boxes = self.mrcn.predict(img_path)
+
+    # get head feats, i.e., net_conv 
+    net_conv = self.mrcn.net._predictions['net_conv']  # Variable cuda (1, 1024, h, w)
+    im_info = self.mrcn.net._im_info  # [[H, W, im_scale]]
+
+    # get cls_to_dets, class_name -> [xyxys] which is (n, 5)
+    cls_to_dets, num_dets = self.cls_to_detections(scores, boxes, nms_thresh, conf_thresh)
+    # make sure num_dets > 0
+    thresh = conf_thresh
+    while num_dets == 0:
+      thresh -= 0.1
+      cls_to_dets, num_dets = self.cls_to_detections(scores, boxes, nms_thresh, thresh)
+
+    # add to dets
+    dets = []
+    det_id = 0
+    for category_name, detections in cls_to_dets.items():
+      # detections: list of (n, 5), [xyxyc]
+      for detection in detections:
+        x1, y1, x2, y2, sc = detection
+        det = {'det_id': det_id, 
+               'box': [x1, y1, x2-x1+1, y2-y1+1],
+               'category_name': category_name,
+               'category_id': self.imdb._class_to_coco_cat_id[category_name],
+               'score': sc}
+        dets += [det]
+        det_id += 1
+    Dets = {det['det_id']: det for det in dets}
+    det_ids = [det['det_id'] for det in dets]
+
+    # 3rd step: compute features, visual_feats (n, 2048+512), att_scores (n, num_atts)
+    pool5, fc7 = self.mrcn.box_to_spatial_fc7(net_conv, im_info, boxes)  # (n, 1024, 7, 7), (n, 2048, 7, 7)
+    visual_feats, att_scores = self.model.sub_encoder.extract_subj_feats(pool5, fc7)
+
+    # return
+    data = {}
+    data['det_ids'] = det_ids
+    data['dets'] = dets
+    data['Feats'] = {'pool5': pool5, 'fc7': fc7, 'visual_feats': visual_feats, 
+                     'att_scores': att_scores}
+    return data
+
+
   def forward_image(self, img_path, nms_thresh=.3, conf_thresh=.65):
     """
     Arguments:
